@@ -1,0 +1,34 @@
+# FocusGate local administrator-managed hooks.
+[features]
+hooks = true
+
+[hooks]
+managed_dir = "/etc/codex/focus-gate"
+
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "/usr/bin/python3 -I -B /etc/codex/focus-gate/focus_gate.py hook --event SessionStart"
+timeout = 5
+statusMessage = "检查本机使用限制"
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "/usr/bin/python3 -I -B /etc/codex/focus-gate/focus_gate.py hook --event UserPromptSubmit"
+timeout = 5
+statusMessage = "检查本机使用限制"
+
+[[hooks.PreToolUse]]
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "/usr/bin/python3 -I -B /etc/codex/focus-gate/focus_gate.py hook --event PreToolUse"
+timeout = 5
+statusMessage = "检查本机使用限制"
+
+[[hooks.PermissionRequest]]
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "/usr/bin/python3 -I -B /etc/codex/focus-gate/focus_gate.py hook --event PermissionRequest"
+timeout = 5
+statusMessage = "检查本机使用限制"
