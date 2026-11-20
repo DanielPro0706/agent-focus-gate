@@ -15,7 +15,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 MESSAGE = "当前处于限制使用时段，请等待限制结束"
 UTC = timezone.utc
-VERSION = 2
+VERSION = 3
+LEGACY_VERSIONS = (1, 2)
 MAX_BODY = 65536
 
 
@@ -179,12 +180,12 @@ def _folder_restrictions(raw):
     return raw
 
 
-def _folder_intervals(rules, folder):
+def _matching_folder_rules(rules, folder):
     if not rules or folder is None:
         return []
     current = _absolute_folder(folder).resolve()
     ancestors = (current, *current.parents)
-    intervals = []
+    matching = []
     for rule in rules:
         root = Path(rule["folder"])
         for ancestor in ancestors:
@@ -196,9 +197,29 @@ def _folder_intervals(rules, folder):
                 except OSError:
                     pass
             if matches:
-                intervals.append((_parse_date(rule["start"]), _parse_date(rule["end"])))
+                matching.append(rule)
                 break
-    return intervals
+    return matching
+
+
+def _folder_intervals(rules, folder):
+    return [(_parse_date(rule["start"]), _parse_date(rule["end"]))
+            for rule in _matching_folder_rules(rules, folder)]
+
+
+def _folder_timer_statuses(raw, now):
+    if not isinstance(raw, list) or len(raw) > 100:
+        raise ValueError("文件夹计时须为不超过 100 项的列表")
+    timers = []
+    for rule in raw:
+        timer = _timer_status(rule, now)
+        if timer is None:
+            raise ValueError("文件夹计时记录损坏")
+        folder = _absolute_folder(rule.get("folder"))
+        if ".." in folder.parts:
+            raise ValueError("文件夹计时路径无效")
+        timers.append({**timer, "folder": str(folder)})
+    return timers
 
 
 def evaluate_state(state, now, folder=None):
@@ -206,18 +227,22 @@ def evaluate_state(state, now, folder=None):
     if state is None:
         return {"configured": False, "restricted": False, "policy": default_policy(),
                 "timer": None, "message": "尚未设置限制规则"}
-    if not isinstance(state, dict) or type(state.get("version")) is not int or state["version"] not in (1, VERSION):
+    if not isinstance(state, dict) or type(state.get("version")) is not int or state["version"] not in (*LEGACY_VERSIONS, VERSION):
         raise ValueError("配置版本无效")
     policy = normalize_policy(state.get("policy"))
     timer = _timer_status(state.get("timer"), now)
     rules = _folder_restrictions(state.get("folder_restrictions", []))
     folder_restricted = any(start <= now < end for start, end in _folder_intervals(rules, folder))
+    folder_timers = _matching_folder_rules(_folder_timer_statuses(state.get("folder_timers", []), now), folder)
+    folder_cooldown = any(item["phase"] == "cooldown" for item in folder_timers)
     restricted = (folder_restricted or is_scheduled(policy, now)
-                  or (timer is not None and timer["phase"] == "cooldown"))
+                  or folder_cooldown or (timer is not None and timer["phase"] == "cooldown"))
     status = {"configured": True, "restricted": restricted, "policy": policy, "timer": timer,
               "message": MESSAGE if restricted else "当前允许使用"}
     if rules:
         status["folder_restrictions"] = rules
+    if folder_timers:
+        status["folder_timers"] = folder_timers
     return status
 
 
@@ -274,8 +299,9 @@ def _restriction_end(status, now, folder=None):
     intervals = _folder_intervals(status.get("folder_restrictions", []), folder)
     if policy["enabled"]:
         intervals.extend((_parse_date(item["start"]), _parse_date(item["end"])) for item in policy["once"])
-    timer = status["timer"]
-    if timer is not None and timer["phase"] != "finished":
+    for timer in (status["timer"], *status.get("folder_timers", [])):
+        if timer is None or timer["phase"] == "finished":
+            continue
         started = _parse_date(timer["started_at"])
         if now < started:
             intervals.append((now, started))
@@ -350,8 +376,9 @@ class StateStore:
     def write(self, state):
         # Store only current fields so legacy overrides and credentials are discarded.
         saved = {"version": VERSION, "policy": state["policy"], "timer": state.get("timer")}
-        if state.get("folder_restrictions"):
-            saved["folder_restrictions"] = state["folder_restrictions"]
+        for key in ("folder_restrictions", "folder_timers"):
+            if state.get(key):
+                saved[key] = state[key]
         # Atomic edit: readers see the previous or the next complete file.
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".state-", dir=self.directory, delete=False) as target:
             os.chmod(target.name, 0o600)
@@ -368,11 +395,11 @@ class StateStore:
 
     def migrate(self):
         state = self.read()
-        if state is None or state.get("version") != 1:
+        if state is None or state.get("version") not in LEGACY_VERSIONS:
             return
         with self.locked():
             state = self.read()
-            if state is not None and state.get("version") == 1:
+            if state is not None and state.get("version") in LEGACY_VERSIONS:
                 evaluate_state(state, datetime.now(UTC))
                 self.write(state)
 
@@ -423,23 +450,32 @@ class Controller:
             self.store.write(state)
             return evaluate_state(state, now, folder)
 
-    def start_timer(self, minutes, now=None):
+    def start_timer(self, minutes, now=None, folder=None):
         minutes = _integer(minutes, 1, 240, "限时使用分钟数")
+        folder = _existing_folder(folder) if folder is not None else None
         with self.store.locked():
             now = _aware(now or datetime.now(UTC)).astimezone(UTC)
             state = self.store.read()
-            current = evaluate_state(state, now)
-            timer = current["timer"]
-            if timer and timer["phase"] != "finished":
+            current = evaluate_state(state, now, folder)
+            applicable_timers = (current["timer"], *current.get("folder_timers", []))
+            if any(timer is not None and timer["phase"] != "finished" for timer in applicable_timers):
                 raise ValueError("计时已开始，请等待使用期和冷却期结束")
             if current["restricted"]:
-                raise ValueError("当前处于全局限制使用时段，请等待限制结束")
+                raise ValueError("当前范围处于限制使用时段，请等待限制结束")
             state = state if state is not None else {"version": VERSION, "policy": current["policy"]}
             allowed = now + timedelta(minutes=minutes)
-            state["timer"] = {"started_at": _iso(now), "allowed_until": _iso(allowed),
-                              "lock_until": _iso(allowed + timedelta(hours=1))}
+            timer = {"started_at": _iso(now), "allowed_until": _iso(allowed),
+                     "lock_until": _iso(allowed + timedelta(hours=1))}
+            if folder is None:
+                state["timer"] = timer
+            else:
+                timers = [item for item in state.get("folder_timers", [])
+                          if _timer_status(item, now)["phase"] != "finished"]
+                timers.append({**timer, "folder": str(folder)})
+                _folder_timer_statuses(timers, now)
+                state["folder_timers"] = timers
             self.store.write(state)
-            return evaluate_state(state, now)
+            return evaluate_state(state, now, folder)
 
 
 def run_hook(store, event):
@@ -464,7 +500,7 @@ def main():
     parser.add_argument("command", choices=("hook", "restrict", "timer", "configure", "status"))
     parser.add_argument("--data-dir", help="独立测试或部署的数据目录；日常使用请勿指定")
     parser.add_argument("--minutes", type=int, help="restrict 1—10080；timer 1—240")
-    parser.add_argument("--folder", help="restrict 或 status 对应的文件夹绝对路径")
+    parser.add_argument("--folder", help="restrict、timer 或 status 对应的文件夹绝对路径")
     parser.add_argument("--policy-file", help="configure 使用的 JSON 策略文件；- 表示从 stdin 读取")
     parser.add_argument("--event", choices=("SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest"))
     args = parser.parse_args()
@@ -474,8 +510,8 @@ def main():
         run_hook(store, args.event or "UserPromptSubmit")
         return 0
     try:
-        if args.folder is not None and args.command not in ("restrict", "status"):
-            raise ValueError("--folder 仅用于 restrict 或 status")
+        if args.folder is not None and args.command not in ("restrict", "timer", "status"):
+            raise ValueError("--folder 仅用于 restrict、timer 或 status")
         folder = _existing_folder(args.folder) if args.folder is not None else None
         if args.command == "status":
             store.migrate()
@@ -483,7 +519,7 @@ def main():
         elif args.command == "restrict":
             result = controller.restrict(args.minutes, folder=folder)
         elif args.command == "timer":
-            result = controller.start_timer(args.minutes)
+            result = controller.start_timer(args.minutes, folder=folder)
         else:
             if not args.policy_file:
                 raise ValueError("configure 需要 --policy-file")

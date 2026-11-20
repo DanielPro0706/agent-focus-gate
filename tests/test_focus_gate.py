@@ -394,7 +394,7 @@ class MutationTests(unittest.TestCase):
 
         self.store.migrate()
         migrated = json.loads(self.store.path.read_bytes())
-        self.assertEqual(migrated["version"], 2)
+        self.assertEqual(migrated["version"], gate.VERSION)
         self.assertEqual(migrated["policy"], saved["policy"])
         self.assertEqual(migrated["timer"], saved["timer"])
         self.assertEqual(migrated["folder_restrictions"], saved["folder_restrictions"])
@@ -411,6 +411,29 @@ class MutationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.store.migrate()
         self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_previous_state_keeps_its_global_timer_when_adding_a_scoped_timer(self):
+        project = self.directory / "Project"
+        project.mkdir()
+        timer = {
+            "started_at": "2026-11-14T09:00:00+08:00",
+            "allowed_until": "2026-11-14T09:30:00+08:00",
+            "lock_until": "2026-11-14T10:30:00+08:00",
+        }
+        saved = {**current_state(self.state["policy"], timer), "version": 2}
+        self.store.path.write_text(json.dumps(saved), encoding="utf-8")
+        self.assertEqual(self.store.status(self.now, folder=project)["timer"]["phase"], "cooldown")
+        self.store.migrate()
+        migrated = self.store.read()
+        self.assertEqual(migrated["version"], gate.VERSION)
+        self.assertEqual(migrated["timer"], timer)
+        self.assertEqual(migrated["policy"], saved["policy"])
+
+        after_restriction = instant("2026-11-14T12:00:00+08:00")
+        result = self.controller.start_timer(60, now=after_restriction, folder=project)
+        self.assertEqual(result["timer"]["phase"], "finished")
+        self.assertEqual(result["folder_timers"][0]["phase"], "using")
+        self.assertEqual(self.store.read()["timer"], timer)
 
     def test_state_files_and_directory_are_private(self):
         self.assertEqual(self.directory.stat().st_mode & 0o777, 0o700)
@@ -542,6 +565,89 @@ class NativeCommandTests(unittest.TestCase):
         self.assertEqual(instant(saved["timer"]["allowed_until"]) - self.now, gate.timedelta(minutes=30))
         self.assertFalse(gate.evaluate_state(saved, self.now)["restricted"])
 
+    def test_scoped_timer_cools_only_the_project_and_its_descendants(self):
+        target = self.directory / "Project"
+        child = target / "src"
+        sibling = self.directory / "Project Archive"
+        child.mkdir(parents=True)
+        sibling.mkdir()
+
+        result = self.controller.start_timer(30, now=self.now, folder=target)
+        self.assertIsNone(result["timer"])
+        timer, = result["folder_timers"]
+        self.assertEqual(timer["folder"], str(target.resolve()))
+        self.assertEqual(instant(timer["allowed_until"]) - self.now, gate.timedelta(minutes=30))
+        self.assertEqual(instant(timer["lock_until"]) - instant(timer["allowed_until"]), gate.timedelta(hours=1))
+        for when, phase, expected in [
+            ("2026-11-14T10:29:59+08:00", "using", False),
+            ("2026-11-14T10:30:00+08:00", "cooldown", True),
+            ("2026-11-14T11:29:59+08:00", "cooldown", True),
+            ("2026-11-14T11:30:00+08:00", "finished", False),
+        ]:
+            with self.subTest(when=when):
+                now = instant(when)
+                for folder in (target, child):
+                    status = self.store.status(now, folder=folder)
+                    self.assertEqual(status["restricted"], expected)
+                    self.assertEqual(status["folder_timers"][0]["phase"], phase)
+                for folder in (sibling, None):
+                    status = self.store.status(now, folder=folder)
+                    self.assertFalse(status["restricted"])
+                    self.assertFalse(status.get("folder_timers"))
+
+        cooldown = instant("2026-11-14T10:30:00+08:00").astimezone(gate.UTC)
+        status = self.store.status(cooldown, folder=child)
+        self.assertEqual(gate._restriction_message(status, cooldown, child), MESSAGE + "。剩余 1 小时")
+
+    def test_scoped_timer_cannot_be_replaced_or_restarted_but_sibling_can_start(self):
+        target = self.directory / "Project"
+        child = target / "src"
+        sibling = self.directory / "Another Project"
+        child.mkdir(parents=True)
+        sibling.mkdir()
+        self.controller.start_timer(30, now=self.now, folder=target)
+        before = self.store.path.read_bytes()
+        for when in ("2026-11-14T10:15:00+08:00", "2026-11-14T10:45:00+08:00"):
+            for folder in (target, child):
+                with self.subTest(when=when, folder=folder), self.assertRaises(ValueError):
+                    self.controller.start_timer(60, now=instant(when), folder=folder)
+                self.assertEqual(self.store.path.read_bytes(), before)
+
+        overlap = instant("2026-11-14T10:45:00+08:00")
+        other = self.controller.start_timer(60, now=overlap, folder=sibling)
+        self.assertEqual(other["folder_timers"][0]["folder"], str(sibling.resolve()))
+        self.assertFalse(other["restricted"])
+        self.assertTrue(self.store.status(overlap, folder=target)["restricted"])
+        restarted = self.controller.start_timer(60, now=instant("2026-11-14T11:30:00+08:00"), folder=target)
+        self.assertEqual(restarted["folder_timers"][0]["phase"], "using")
+
+    def test_live_global_timer_prevents_starting_an_applicable_scoped_timer(self):
+        target = self.directory / "Project"
+        target.mkdir()
+        self.controller.start_timer(30, now=self.now)
+        before = self.store.path.read_bytes()
+        for when in ("2026-11-14T10:15:00+08:00", "2026-11-14T10:45:00+08:00"):
+            with self.subTest(when=when), self.assertRaises(ValueError):
+                self.controller.start_timer(60, now=instant(when), folder=target)
+            self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_restrict_and_configure_preserve_an_existing_scoped_timer(self):
+        target = self.directory / "Project"
+        sibling = self.directory / "Another Project"
+        target.mkdir()
+        sibling.mkdir()
+        self.controller.start_timer(30, now=self.now, folder=target)
+        before = self.store.read()["folder_timers"]
+        cooldown = instant("2026-11-14T10:30:00+08:00")
+
+        self.controller.configure(policy(), now=cooldown)
+        self.controller.restrict(15, now=cooldown, folder=sibling)
+        self.controller.start_timer(60, now=cooldown)
+        after = self.store.read()
+        self.assertEqual(after["folder_timers"], before)
+        self.assertTrue(self.store.status(cooldown, folder=target)["restricted"])
+        self.assertEqual(self.store.status(cooldown, folder=sibling)["timer"]["phase"], "using")
+
 
     def test_ongoing_timer_cannot_be_reset(self):
         self.controller.start_timer(30, now=self.now)
@@ -635,7 +741,7 @@ class NativeCliTests(unittest.TestCase):
         result, status = self.command(["timer", "--minutes", "30"])
         self.assertEqual(result, 0)
         self.assertEqual(status["timer"]["phase"], "using")
-        self.assertEqual(self.store.read()["version"], 2)
+        self.assertEqual(self.store.read()["version"], gate.VERSION)
         self.assertNotIn("password", self.store.read())
 
     def test_cli_cannot_replace_an_ongoing_timer(self):
@@ -654,7 +760,7 @@ class NativeCliTests(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(status["policy"], saved["policy"])
         migrated = json.loads(self.store.path.read_bytes())
-        self.assertEqual(migrated["version"], 2)
+        self.assertEqual(migrated["version"], gate.VERSION)
         self.assertFalse({"password", "auth_failures", "unlock"} & migrated.keys())
 
     def test_restrict_does_not_read_chat_prompt(self):
@@ -670,7 +776,7 @@ class NativeCliTests(unittest.TestCase):
             result, status = self.command(["restrict", "--minutes", "30"])
         self.assertEqual(result, 0)
         self.assertTrue(status["restricted"])
-        self.assertEqual(self.store.read()["version"], 2)
+        self.assertEqual(self.store.read()["version"], gate.VERSION)
 
     def test_folder_cli_and_hooks_use_the_session_directory(self):
         self.configure()
@@ -719,11 +825,51 @@ class NativeCliTests(unittest.TestCase):
         self.configure()
         before = self.store.path.read_bytes()
         for folder in ["relative", str(self.directory / "Missing"), str(self.store.path)]:
-            with self.subTest(folder=folder):
-                result, status = self.command(["restrict", "--minutes", "20", "--folder", folder])
-                self.assertEqual(result, 1)
-                self.assertFalse(status["ok"])
-                self.assertEqual(self.store.path.read_bytes(), before)
+            for command in ("restrict", "timer"):
+                with self.subTest(folder=folder, command=command):
+                    result, status = self.command([command, "--minutes", "20", "--folder", folder])
+                    self.assertEqual(result, 1)
+                    self.assertFalse(status["ok"])
+                    self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_scoped_timer_cli_stores_the_resolved_folder_and_status_filters_it(self):
+        target = self.directory / "Project Folder"
+        alias = self.directory / "Alias"
+        sibling = self.directory / "Another Project"
+        target.mkdir()
+        sibling.mkdir()
+        alias.symlink_to(target, target_is_directory=True)
+        result, started = self.command(["timer", "--minutes", "60", "--folder", str(alias)])
+        self.assertEqual(result, 0)
+        self.assertIsNone(started["timer"])
+        self.assertFalse(started["restricted"])
+        timer, = started["folder_timers"]
+        self.assertEqual(timer["folder"], str(target.resolve()))
+        self.assertEqual(timer["phase"], "using")
+        result, status = self.command(["status", "--folder", str(sibling)])
+        self.assertEqual(result, 0)
+        self.assertFalse(status.get("folder_timers"))
+
+    def test_scoped_timer_blocks_hooks_from_its_cooldown_folder(self):
+        target = self.directory / "Project Folder"
+        child = target / "src"
+        other = self.directory / "Another Project"
+        child.mkdir(parents=True)
+        other.mkdir()
+        now = datetime.now(gate.UTC)
+        controller = gate.Controller(self.store)
+        controller.start_timer(1, now=now - gate.timedelta(minutes=20, seconds=15), folder=target)
+        command = [sys.executable, "-B", str(MODULE_PATH), "hook", "--data-dir", str(self.directory)]
+        for folder, restricted in ((target, True), (child, True), (other, False)):
+            for event in ("SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest"):
+                with self.subTest(folder=folder, event=event):
+                    result = subprocess.run(
+                        command + ["--event", event], cwd=folder,
+                        input=json.dumps({"hook_event_name": event}), text=True, capture_output=True, check=True,
+                    )
+                    self.assertEqual(json.loads(result.stdout), gate.hook_output(
+                        event, restricted, MESSAGE + "。剩余 41 分钟"
+                    ))
 
     def test_configure_from_stdin_initializes_and_saves_policy_and_selected_timezone(self):
         self.assertFalse(self.store.path.exists())

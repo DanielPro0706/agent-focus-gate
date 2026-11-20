@@ -2,7 +2,7 @@
 
 [简体中文](README.md) · English
 
-Set usage limits for local Codex on macOS. Pause all projects immediately, block sessions on a schedule, set a usage timer followed by a cooldown, or pause a single project. Codex's administrator-managed hooks enforce those limits. [Codex managed hooks](https://learn.chatgpt.com/docs/hooks#managed-hooks-in-local-codex)
+Set usage limits for local Codex on macOS. Block all sessions immediately, block sessions on a schedule, pause one project, or start a global or project-specific usage timer. Codex's administrator-managed hooks enforce those limits. [Codex managed hooks](https://learn.chatgpt.com/docs/hooks#managed-hooks-in-local-codex)
 
 > [!IMPORTANT]
 > Once a timer starts, there is no way to lift the restriction through any Focus Gate command or interface. You can start a new timer after both the usage period and the one-hour cooldown have ended.
@@ -13,7 +13,7 @@ Set usage limits for local Codex on macOS. Pause all projects immediately, block
 | --- | --- | --- |
 | **Block all sessions** | Pause all local Codex sessions immediately until the restriction expires | Block all sessions for two hours |
 | **Scheduled blocks** | Repeat a block on specific weekdays or schedule a one-off window | Block every day from 22:00 to 08:00 the next day |
-| **Usage timer** | Allow a set amount of time, then start a one-hour global cooldown | Use Codex for 45 more minutes, then cool down |
+| **Usage timer** | Set a usage period for all sessions or one project, followed by a one-hour cooldown in that scope | Use the current project for one more hour, then cool down |
 | **Block one project** | Pause sessions in a folder and its subfolders | Block the current project for 30 minutes |
 | **Status** | Check restrictions for the current folder, global schedules, timers, and project rules | Check whether the current project is restricted |
 
@@ -77,11 +77,21 @@ JSON
 
 ### Allow time before a cooldown
 
+Start a global timer to put all local sessions on cooldown after 45 minutes.
+
 ```sh
 focus_gate timer --minutes 45
 ```
 
-Choose 1–240 minutes. The timer starts immediately and keeps counting if Codex closes, macOS locks, or the computer sleeps. A one-hour global cooldown begins when the usage period ends. Existing global and project rules apply on their own schedules. Focus Gate rejects requests to reset or extend a timer during either the usage period or the cooldown.
+For a timer that only applies to one project, run this command from its root folder.
+
+```sh
+focus_gate timer --minutes 60 --folder "$PWD"
+```
+
+Choose 1–240 minutes for either timer. It starts immediately and keeps counting if Codex closes, macOS locks, or the computer sleeps. A one-hour cooldown starts when the usage period ends. A project cooldown only blocks sessions whose working directories are in the specified folder or its subfolders. Existing global and project restrictions can still block sessions during the usage period.
+
+A project timer cannot start while a global timer or a project timer covering that folder is in its usage period or cooldown. Projects with separate scopes can have independent timers.
 
 ### Block one project
 
@@ -90,14 +100,14 @@ Choose 1–240 minutes. The timer starts immediately and keeps counting if Codex
 focus_gate restrict --minutes 30 --folder "$PWD"
 ```
 
-Focus Gate matches the session's working directory against the target folder and its subfolders, resolving symbolic links. A Git worktree elsewhere is evaluated from its own working directory.
+For project blocks and timers, Focus Gate matches the session's working directory against the target folder and its subfolders, resolving symbolic links. A Git worktree elsewhere is evaluated from its own working directory.
 
 ### Check status
 
 | Command | What it shows |
 | --- | --- |
-| `focus_gate status` | Whether the current directory is restricted, global schedules, timers, and folder rules |
-| `focus_gate status --folder "$PWD"` | Status for a specified folder. Replace `"$PWD"` with the project's absolute path. |
+| `focus_gate status` | Whether the current directory is restricted, global schedules and timers, applicable project timers, and folder rules |
+| `focus_gate status --folder "$PWD"` | The same information for a specified folder. Replace `"$PWD"` with the project's absolute path. |
 
 ## Enforcement scope
 
@@ -107,7 +117,7 @@ Rules and timers are stored in the current account's `~/Library/Application Supp
 
 ## Update and test
 
-Pull and review the latest code, rerun the install and check commands, then run `focus_gate status`. Migration preserves existing restrictions and timers while removing obsolete credentials and temporary overrides. The installer archives the previous managed script.
+Pull and review the latest code, rerun the install and check commands, then run `focus_gate status`. Migration upgrades state from version 1 or 2 to version 3. It preserves existing restrictions and timers and removes obsolete credentials and temporary overrides. The installer archives the previous managed script.
 
 Run the suite from the repository root. It uses a temporary state directory and runs under a regular account.
 
