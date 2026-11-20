@@ -1,6 +1,7 @@
-"""Boundary, authentication, and documented hook-contract checks for FocusGate."""
+"""Boundary, migration, and documented hook-contract checks for FocusGate."""
 
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -19,7 +20,7 @@ SPEC = importlib.util.spec_from_file_location("focus_gate", MODULE_PATH)
 gate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gate)
 
-MESSAGE = "当前处于限制使用时段，请使用Chat模式或输入密码"
+MESSAGE = "当前处于限制使用时段，请等待限制结束"
 
 
 def instant(value):
@@ -137,76 +138,56 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(original, snapshot)
 
 
-class AuthenticationTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.password = "private-local-test-password"
-        cls.record = gate.make_password(cls.password)
+def current_state(configured=None, timer=None):
+    return {"version": gate.VERSION, "policy": policy() if configured is None else configured, "timer": timer}
 
-    def test_password_hash_verification(self):
-        self.assertTrue(gate.verify_password(self.password, self.record))
-        self.assertFalse(gate.verify_password("incorrect-password", self.record))
 
-    def test_password_not_stored_as_plaintext(self):
-        self.assertNotIn(self.password, repr(self.record))
-
-    def test_password_salt_is_random(self):
-        self.assertNotEqual(self.record, gate.make_password(self.password))
-
-    def test_policy_fingerprint_is_stable(self):
-        configured = policy(daily=[{"days": [0], "start": "09:00", "end": "10:00"}])
-        self.assertEqual(gate.policy_fingerprint(configured), gate.policy_fingerprint(copy.deepcopy(configured)))
-        changed = copy.deepcopy(configured)
-        changed["enabled"] = False
-        self.assertNotEqual(gate.policy_fingerprint(configured), gate.policy_fingerprint(changed))
+def legacy_state(configured, timer=None):
+    state = current_state(configured, timer)
+    fixture_bytes = "A" * 43 + "="
+    fingerprint = hashlib.sha256(
+        json.dumps(configured, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    state.update({
+        "version": 1,
+        "password": {
+            "algorithm": "pbkdf2-sha256",
+            "iterations": 600000,
+            "salt": fixture_bytes,
+            "digest": fixture_bytes,
+        },
+        "auth_failures": {"count": 2},
+        "unlock": {
+            "issued_at": "2026-11-14T09:55:00+08:00",
+            "until": "2026-11-14T10:10:00+08:00",
+            "policy_hash": fingerprint,
+        },
+    })
+    return state
 
 
 class StateTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.record = gate.make_password("private-local-state-password")
-
     def setUp(self):
         self.configured = policy(daily=[{"days": list(range(7)), "start": "09:00", "end": "12:00"}])
-        self.state = {"version": 1, "password": copy.deepcopy(self.record), "policy": self.configured, "unlock": None}
+        self.state = current_state(self.configured)
         self.now = instant("2026-11-14T10:00:00+08:00")
 
-    def unlock(self, issued="2026-11-14T09:55:00+08:00", until="2026-11-14T10:10:00+08:00", minutes=15):
-        self.state["unlock"] = {"issued_at": issued, "until": until, "minutes": minutes, "policy_hash": gate.policy_fingerprint(self.configured)}
+    def test_missing_state_does_not_restrict(self):
+        self.assertFalse(gate.evaluate_state(None, self.now)["restricted"])
 
-    def test_missing_state_is_unconfigured_and_allows(self):
-        status = gate.evaluate_state(None, self.now)
-        self.assertFalse(status["configured"])
-        self.assertFalse(status["restricted"])
-
-    def test_configured_locked_state_restricts(self):
+    def test_configured_state_restricts(self):
         status = gate.evaluate_state(self.state, self.now)
-        self.assertTrue(status["configured"])
         self.assertTrue(status["restricted"])
         self.assertEqual(status["message"], MESSAGE)
 
-    def test_valid_unlock_allows(self):
-        self.unlock()
-        status = gate.evaluate_state(self.state, self.now)
-        self.assertFalse(status["restricted"])
-        self.assertIsNotNone(status["unlocked_until"])
-
-    def test_expiration_is_exclusive(self):
-        self.unlock()
-        self.assertTrue(gate.evaluate_state(self.state, instant("2026-11-14T10:10:00+08:00"))["restricted"])
-
-    def test_clock_rollback_cannot_precede_unlock_issue(self):
-        self.unlock(issued="2026-11-14T10:01:00+08:00", until="2026-11-14T10:16:00+08:00")
-        self.assertTrue(gate.evaluate_state(self.state, self.now)["restricted"])
-
-    def test_policy_change_invalidates_unlock(self):
-        self.unlock()
-        self.state["policy"] = policy(daily=[{"days": list(range(7)), "start": "08:00", "end": "12:00"}])
-        self.assertTrue(gate.evaluate_state(self.state, self.now)["restricted"])
-
-    def test_overlong_unlock_is_rejected(self):
-        self.unlock(issued="2026-11-14T09:55:00+08:00", until="2026-11-14T12:55:00+08:00", minutes=180)
-        self.assertTrue(gate.evaluate_state(self.state, self.now)["restricted"])
+    def test_legacy_unlock_fields_cannot_override_an_active_schedule(self):
+        saved = legacy_state(self.configured)
+        for version in (1, gate.VERSION):
+            with self.subTest(version=version):
+                saved["version"] = version
+                status = gate.evaluate_state(saved, self.now)
+                self.assertTrue(status["restricted"])
+                self.assertNotIn("unlocked_until", status)
 
     def test_corrupt_state_cannot_silently_allow(self):
         try:
@@ -215,7 +196,7 @@ class StateTests(unittest.TestCase):
             return
         self.assertTrue(status["restricted"])
 
-    def test_outside_interval_does_not_require_unlock(self):
+    def test_outside_interval_allows(self):
         self.assertFalse(gate.evaluate_state(self.state, instant("2026-11-14T13:00:00+08:00"))["restricted"])
 
 
@@ -292,22 +273,13 @@ class CountdownTests(unittest.TestCase):
 
 
 class TimerTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.record = gate.make_password("private-local-timer-password")
-
     def setUp(self):
-        self.state = {
-            "version": 1,
-            "password": copy.deepcopy(self.record),
-            "policy": policy(),
-            "unlock": None,
-            "timer": {
-                "started_at": "2026-11-14T09:00:00+08:00",
-                "allowed_until": "2026-11-14T09:30:00+08:00",
-                "lock_until": "2026-11-14T10:30:00+08:00",
-            },
-        }
+        self.now = instant("2026-11-14T10:00:00+08:00")
+        self.state = current_state(timer={
+            "started_at": "2026-11-14T09:00:00+08:00",
+            "allowed_until": "2026-11-14T09:30:00+08:00",
+            "lock_until": "2026-11-14T10:30:00+08:00",
+        })
 
     def test_timer_allowance_and_cooldown_boundaries(self):
         for value, expected, phase in [
@@ -335,15 +307,10 @@ class TimerTests(unittest.TestCase):
         self.state["policy"] = policy(daily=[{"days": list(range(7)), "start": "09:00", "end": "10:00"}])
         self.assertTrue(gate.evaluate_state(self.state, instant("2026-11-14T09:15:00+08:00"))["restricted"])
 
-    def test_valid_password_unlock_overrides_timer_cooldown(self):
-        self.state["unlock"] = {
-            "issued_at": "2026-11-14T09:35:00+08:00",
-            "until": "2026-11-14T09:50:00+08:00",
-            "minutes": 15,
-            "policy_hash": gate.policy_fingerprint(self.state["policy"]),
-        }
-        self.assertFalse(gate.evaluate_state(self.state, instant("2026-11-14T09:40:00+08:00"))["restricted"])
-        self.assertTrue(gate.evaluate_state(self.state, instant("2026-11-14T09:50:00+08:00"))["restricted"])
+
+    def test_legacy_unlock_cannot_override_a_cooldown(self):
+        saved = legacy_state(self.state["policy"], self.state["timer"])
+        self.assertTrue(gate.evaluate_state(saved, self.now)["restricted"])
 
     def test_malformed_timer_does_not_silently_allow(self):
         self.state["timer"]["lock_until"] = "2026-11-14T09:45:00+08:00"
@@ -354,11 +321,10 @@ class TimerTests(unittest.TestCase):
         self.assertTrue(status["restricted"])
 
 
+
 class MutationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.password = "private-local-controller-password"
-        cls.record = gate.make_password(cls.password)
         cls.run_root = Path(tempfile.mkdtemp(prefix="agent-focus-gate-tests-"))
 
     def setUp(self):
@@ -366,79 +332,85 @@ class MutationTests(unittest.TestCase):
         self.store = gate.StateStore(self.directory)
         self.controller = gate.Controller(self.store)
         self.now = instant("2026-11-14T10:00:00+08:00")
-        self.state = {
-            "version": 1,
-            "password": copy.deepcopy(self.record),
-            "policy": policy(daily=[{"days": list(range(7)), "start": "09:00", "end": "12:00"}]),
-            "unlock": None,
-            "timer": None,
-        }
+        self.state = current_state(policy(daily=[{"days": list(range(7)), "start": "09:00", "end": "12:00"}]))
         with self.store.locked():
             self.store.write(self.state)
 
-    def test_wrong_password_cannot_modify_policy_or_timer(self):
-        for route, body in [
-            ("/api/policy", {"password": "wrong-password", "policy": policy(enabled=False)}),
-            ("/api/timer", {"password": "wrong-password", "minutes": 30}),
-            ("/api/timer/cancel", {"password": "wrong-password"}),
-            ("/api/unlock", {"password": "wrong-password", "minutes": 15}),
-        ]:
-            with self.subTest(route=route), self.assertRaises(gate.AuthError):
-                self.controller.action(route, body, self.now)
-            saved = self.store.read()
-            self.assertEqual(saved["policy"], self.state["policy"])
-            self.assertIsNone(saved["timer"])
-            self.assertIsNone(saved["unlock"])
+    def test_configure_cannot_shorten_or_disable_an_active_schedule(self):
+        before = self.store.path.read_bytes()
+        candidates = (
+            policy(),
+            policy(enabled=False),
+            policy(daily=[{"days": list(range(7)), "start": "09:00", "end": "10:30"}]),
+        )
+        for configured in candidates:
+            with self.subTest(configured=configured), self.assertRaises(ValueError):
+                self.controller.configure(configured, now=self.now)
+            self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertTrue(self.store.status(instant("2026-11-14T11:59:59+08:00"))["restricted"])
 
-    def test_five_wrong_passwords_impose_thirty_second_wait(self):
-        for _ in range(5):
-            with self.assertRaises(gate.AuthError):
-                self.controller.action("/api/unlock", {"password": "wrong-password", "minutes": 15}, self.now)
-        for value in ["2026-11-14T10:00:00+08:00", "2026-11-14T10:00:29+08:00"]:
-            with self.subTest(value=value), self.assertRaises(gate.AuthError):
-                self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, instant(value))
-        # A new controller must observe the persisted lockout too.
-        with self.assertRaises(gate.AuthError):
-            gate.Controller(gate.StateStore(self.directory)).action(
-                "/api/unlock", {"password": self.password, "minutes": 15}, instant("2026-11-14T10:00:15+08:00"))
-        status = self.controller.action(
-            "/api/unlock", {"password": self.password, "minutes": 15}, instant("2026-11-14T10:00:30+08:00"))
-        self.assertFalse(status["restricted"])
-        self.assertEqual(self.store.read()["auth_failures"]["count"], 0)
+    def test_configure_can_change_daily_rules_after_the_previous_window(self):
+        end = instant("2026-11-14T12:00:00+08:00")
+        configured = policy(daily=[{"days": list(range(7)), "start": "13:00", "end": "14:00"}])
+        self.controller.configure(configured, now=end)
+        self.assertEqual(self.store.read()["policy"], configured)
+        self.assertFalse(self.store.status(end)["restricted"])
+        self.assertTrue(self.store.status(instant("2026-11-14T13:00:00+08:00"))["restricted"])
 
-    def test_changing_policy_clears_temporary_unlock(self):
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, self.now)
-        self.assertIsNotNone(self.store.read()["unlock"])
-        status = self.controller.action("/api/policy", {"password": self.password, "policy": self.state["policy"]}, self.now)
-        self.assertIsNone(self.store.read()["unlock"])
-        self.assertTrue(status["restricted"])
+    def test_configure_preserves_pending_one_off_rules(self):
+        next_day = {"start": "2026-11-15T09:00:00+08:00", "end": "2026-11-15T10:30:00+08:00"}
+        future_rule = policy(once=[next_day])["once"][0]
+        before_window = instant("2026-11-14T08:00:00+08:00")
+        self.controller.configure(policy(once=[next_day]), now=before_window)
+        self.controller.configure(policy(), now=before_window)
+        self.assertIn(future_rule, self.store.read()["policy"]["once"])
+        self.assertTrue(self.store.status(instant("2026-11-15T10:00:00+08:00"))["restricted"])
 
-    def test_changing_or_cancelling_timer_clears_unlock(self):
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, self.now)
-        self.controller.action("/api/timer", {"password": self.password, "minutes": 30}, self.now)
-        saved = self.store.read()
-        self.assertIsNone(saved["unlock"])
-        self.assertEqual(instant(saved["timer"]["lock_until"]) - instant(saved["timer"]["allowed_until"]), gate.timedelta(hours=1))
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, self.now)
-        self.controller.action("/api/timer/cancel", {"password": self.password}, self.now)
-        saved = self.store.read()
-        self.assertIsNone(saved["timer"])
-        self.assertIsNone(saved["unlock"])
+    def test_configure_cannot_disable_pending_one_off_rules(self):
+        start = instant("2026-11-14T08:00:00+08:00")
+        next_day = {"start": "2026-11-15T09:00:00+08:00", "end": "2026-11-15T10:30:00+08:00"}
+        self.controller.configure(policy(once=[next_day]), now=start)
+        before = self.store.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.controller.configure(policy(enabled=False), now=start)
+        self.assertEqual(self.store.path.read_bytes(), before)
 
-    def test_manual_relock_does_not_require_password(self):
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, self.now)
-        status = self.controller.action("/api/lock", {}, self.now)
-        self.assertIsNone(self.store.read()["unlock"])
-        self.assertTrue(status["restricted"])
+    def test_migration_preserves_all_rules_and_removes_legacy_credentials(self):
+        timer = {
+            "started_at": "2026-11-14T09:00:00+08:00",
+            "allowed_until": "2026-11-14T09:30:00+08:00",
+            "lock_until": "2026-11-14T10:30:00+08:00",
+        }
+        saved = legacy_state(self.state["policy"], timer)
+        saved["folder_restrictions"] = [{
+            "folder": str(self.directory.resolve()),
+            "start": "2026-11-14T09:00:00+08:00",
+            "end": "2026-11-14T11:00:00+08:00",
+        }]
+        self.store.path.write_text(json.dumps(saved), encoding="utf-8")
+        before = self.store.path.read_bytes()
+        self.assertTrue(self.store.status(self.now, folder=self.directory)["restricted"])
+        self.assertEqual(self.store.path.read_bytes(), before)
 
-    def test_changing_password_invalidates_unlock_and_old_password(self):
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, self.now)
-        new_password = "another-private-controller-password"
-        self.controller.action("/api/password", {"password": self.password, "new_password": new_password}, self.now)
-        saved = self.store.read()
-        self.assertIsNone(saved["unlock"])
-        self.assertFalse(gate.verify_password(self.password, saved["password"]))
-        self.assertTrue(gate.verify_password(new_password, saved["password"]))
+        self.store.migrate()
+        migrated = json.loads(self.store.path.read_bytes())
+        self.assertEqual(migrated["version"], 2)
+        self.assertEqual(migrated["policy"], saved["policy"])
+        self.assertEqual(migrated["timer"], saved["timer"])
+        self.assertEqual(migrated["folder_restrictions"], saved["folder_restrictions"])
+        self.assertFalse({"password", "auth_failures", "unlock"} & migrated.keys())
+        self.assertTrue(self.store.status(self.now, folder=self.directory)["restricted"])
+
+        after = self.store.path.read_bytes()
+        self.store.migrate()
+        self.assertEqual(self.store.path.read_bytes(), after)
+
+    def test_invalid_legacy_rules_cannot_be_replaced_by_migration(self):
+        self.store.path.write_text(json.dumps(legacy_state({"enabled": True})), encoding="utf-8")
+        before = self.store.path.read_bytes()
+        with self.assertRaises(ValueError):
+            self.store.migrate()
+        self.assertEqual(self.store.path.read_bytes(), before)
 
     def test_state_files_and_directory_are_private(self):
         self.assertEqual(self.directory.stat().st_mode & 0o777, 0o700)
@@ -476,8 +448,6 @@ class MutationTests(unittest.TestCase):
 class NativeCommandTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.password = "private-native-command-password"
-        cls.record = gate.make_password(cls.password)
         cls.run_root = Path(tempfile.mkdtemp(prefix="agent-focus-gate-tests-"))
 
     def setUp(self):
@@ -485,7 +455,7 @@ class NativeCommandTests(unittest.TestCase):
         self.store = gate.StateStore(self.directory)
         self.controller = gate.Controller(self.store)
         self.now = instant("2026-11-14T10:00:00+08:00")
-        self.state = {"version": 1, "password": copy.deepcopy(self.record), "policy": policy(), "timer": None, "unlock": None}
+        self.state = current_state()
         with self.store.locked():
             self.store.write(self.state)
 
@@ -506,11 +476,9 @@ class NativeCommandTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertTrue(gate.evaluate_state(saved, instant(value))["restricted"])
 
-    def test_restrict_duration_is_exact_and_clears_existing_unlock(self):
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, self.now)
+    def test_restrict_duration_is_exact(self):
         self.controller.restrict(30, now=self.now)
         saved = self.store.read()
-        self.assertIsNone(saved["unlock"])
         for value, expected in [
             ("2026-11-14T09:59:59+08:00", False),
             ("2026-11-14T10:00:00+08:00", True),
@@ -553,66 +521,56 @@ class NativeCommandTests(unittest.TestCase):
                 )
                 self.assertEqual(actual, expected)
 
-    def test_new_folder_restriction_supersedes_only_that_folders_existing_unlock(self):
+
+    def test_folder_restriction_and_global_block_are_independent(self):
         target = self.directory / "Target"
         other = self.directory / "Other"
         target.mkdir()
         other.mkdir()
-        self.controller.restrict(30, now=self.now)
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, self.now)
-        after_unlock = instant("2026-11-14T10:01:00+08:00")
-        self.controller.restrict(30, now=after_unlock, folder=str(target))
-        self.assertTrue(self.store.status(after_unlock, folder=str(target))["restricted"])
-        self.assertFalse(self.store.status(after_unlock, folder=str(other))["restricted"])
-        self.assertTrue(self.store.status(
-            instant("2026-11-14T10:15:00+08:00"), folder=str(other)
-        )["restricted"])
+        self.controller.restrict(15, now=self.now)
+        self.controller.restrict(30, now=self.now, folder=str(target))
+        after_global_end = instant("2026-11-14T10:15:00+08:00")
+        self.assertTrue(self.store.status(self.now, folder=target)["restricted"])
+        self.assertTrue(self.store.status(self.now, folder=other)["restricted"])
+        self.assertTrue(self.store.status(after_global_end, folder=target)["restricted"])
+        self.assertFalse(self.store.status(after_global_end, folder=other)["restricted"])
 
-        after_restrict = instant("2026-11-14T10:02:00+08:00")
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, after_restrict)
-        self.assertFalse(self.store.status(after_restrict, folder=str(target))["restricted"])
-
-    def test_first_timer_can_start_without_password_when_unrestricted(self):
+    def test_first_timer_can_start_when_unrestricted(self):
         self.controller.start_timer(30, now=self.now)
         saved = self.store.read()
         self.assertIsNotNone(saved["timer"])
         self.assertEqual(instant(saved["timer"]["allowed_until"]) - self.now, gate.timedelta(minutes=30))
         self.assertFalse(gate.evaluate_state(saved, self.now)["restricted"])
 
-    def test_resetting_running_timer_requires_password_and_wrong_password_preserves_it(self):
+
+    def test_ongoing_timer_cannot_be_reset(self):
         self.controller.start_timer(30, now=self.now)
-        original = copy.deepcopy(self.store.read()["timer"])
-        for password in [None, "wrong-password"]:
-            with self.subTest(password=password), self.assertRaises(gate.AuthError):
-                self.controller.start_timer(60, password=password, now=instant("2026-11-14T10:10:00+08:00"))
-            self.assertEqual(self.store.read()["timer"], original)
-        self.controller.start_timer(60, password=self.password, now=instant("2026-11-14T10:10:00+08:00"))
-        self.assertEqual(instant(self.store.read()["timer"]["allowed_until"]), instant("2026-11-14T11:10:00+08:00"))
+        before = self.store.path.read_bytes()
+        for minutes in (15, 60):
+            with self.subTest(minutes=minutes), self.assertRaises(ValueError):
+                self.controller.start_timer(minutes, now=instant("2026-11-14T10:10:00+08:00"))
+            self.assertEqual(self.store.path.read_bytes(), before)
 
     def test_cooldown_cannot_be_bypassed_by_starting_another_timer(self):
         self.controller.start_timer(30, now=self.now)
         original = copy.deepcopy(self.store.read()["timer"])
-        with self.assertRaises(gate.AuthError):
+        with self.assertRaises(ValueError):
             self.controller.start_timer(60, now=instant("2026-11-14T10:30:00+08:00"))
         self.assertEqual(self.store.read()["timer"], original)
         self.assertTrue(self.store.status(instant("2026-11-14T10:30:00+08:00"))["restricted"])
 
-    def test_finished_timer_can_start_again_without_password(self):
+    def test_finished_timer_can_start_again(self):
         self.controller.start_timer(30, now=self.now)
         self.controller.start_timer(15, now=instant("2026-11-14T11:30:00+08:00"))
         self.assertEqual(instant(self.store.read()["timer"]["allowed_until"]), instant("2026-11-14T11:45:00+08:00"))
 
-    def test_fixed_restriction_requires_password_to_start_timer(self):
-        self.controller.restrict(30, now=self.now)
-        with self.assertRaises(gate.AuthError):
-            self.controller.start_timer(15, now=self.now)
-        self.assertIsNone(self.store.read()["timer"])
 
-    def test_active_password_unlock_does_not_grant_passwordless_timer_reset(self):
-        self.controller.action("/api/unlock", {"password": self.password, "minutes": 15}, self.now)
-        with self.assertRaises(gate.AuthError):
-            self.controller.start_timer(15, now=self.now)
-        self.assertIsNone(self.store.read()["timer"])
+    def test_configure_does_not_change_a_timer(self):
+        self.controller.start_timer(30, now=self.now)
+        original = copy.deepcopy(self.store.read()["timer"])
+        self.controller.configure(policy(), now=instant("2026-11-14T10:30:00+08:00"))
+        self.assertEqual(self.store.read()["timer"], original)
+        self.assertTrue(self.store.status(instant("2026-11-14T10:45:00+08:00"))["restricted"])
 
     def test_clock_rollback_locks_timer_instead_of_extending_usage(self):
         self.controller.start_timer(30, now=self.now)
@@ -620,7 +578,7 @@ class NativeCommandTests(unittest.TestCase):
         status = self.store.status(rolled_back)
         self.assertTrue(status["restricted"])
         self.assertEqual(status["timer"]["phase"], "cooldown")
-        with self.assertRaises(gate.AuthError):
+        with self.assertRaises(ValueError):
             self.controller.start_timer(60, now=rolled_back)
 
     def test_invalid_durations_leave_schedule_and_timer_unchanged(self):
@@ -637,8 +595,6 @@ class NativeCommandTests(unittest.TestCase):
 class NativeCliTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.password = "private-native-cli-password"
-        cls.record = gate.make_password(cls.password)
         cls.run_root = Path(tempfile.mkdtemp(prefix="agent-focus-gate-tests-"))
 
     def setUp(self):
@@ -647,7 +603,7 @@ class NativeCliTests(unittest.TestCase):
 
     def configure(self):
         with self.store.locked():
-            self.store.write({"version": 1, "password": copy.deepcopy(self.record), "policy": policy(), "timer": None, "unlock": None})
+            self.store.write(current_state())
 
     def command(self, args):
         output = io.StringIO()
@@ -655,43 +611,53 @@ class NativeCliTests(unittest.TestCase):
             result = gate.main()
         return result, json.loads(output.getvalue())
 
-    def test_invalid_duration_does_not_open_password_dialog(self):
-        for command, minutes in [("restrict", "0"), ("timer", "241"), ("unlock", "17")]:
-            with self.subTest(command=command), mock.patch.object(gate, "native_password", side_effect=AssertionError("unexpected password dialog")) as password:
+    def test_invalid_duration_leaves_no_state(self):
+        for command, minutes in [("restrict", "0"), ("timer", "241")]:
+            with self.subTest(command=command):
                 result, status = self.command([command, "--minutes", minutes])
                 self.assertEqual(result, 1)
                 self.assertFalse(status["ok"])
-                password.assert_not_called()
                 self.assertFalse(self.store.path.exists())
 
-    def test_cancelled_initial_setup_leaves_no_state(self):
-        with mock.patch.object(gate, "native_password", side_effect=ValueError("已取消密码输入")) as password:
-            result, status = self.command(["setup"])
-        self.assertEqual(result, 1)
-        self.assertFalse(status["ok"])
-        self.assertFalse(self.store.path.exists())
-        password.assert_called_once()
+    def test_removed_commands_cannot_modify_an_active_timer(self):
+        result, _ = self.command(["timer", "--minutes", "30"])
+        self.assertEqual(result, 0)
+        before = self.store.path.read_bytes()
+        for command in ("setup", "unlock", "cancel-timer", "lock", "password"):
+            with self.subTest(command=command), mock.patch.object(sys, "stderr", io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    self.command([command])
+                self.assertEqual(error.exception.code, 2)
+            self.assertEqual(self.store.path.read_bytes(), before)
 
-    def test_first_timer_with_configured_state_does_not_open_password_dialog(self):
-        self.configure()
-        with mock.patch.object(gate, "native_password", side_effect=AssertionError("unexpected password dialog")) as password:
-            result, status = self.command(["timer", "--minutes", "30"])
+    def test_first_timer_initializes_without_credentials(self):
+        self.assertFalse(self.store.path.exists())
+        result, status = self.command(["timer", "--minutes", "30"])
         self.assertEqual(result, 0)
         self.assertEqual(status["timer"]["phase"], "using")
-        password.assert_not_called()
+        self.assertEqual(self.store.read()["version"], 2)
+        self.assertNotIn("password", self.store.read())
 
-    def test_resetting_timer_uses_native_password_and_preserves_secret(self):
-        self.configure()
-        self.command(["timer", "--minutes", "30"])
-        with mock.patch.object(gate, "native_password", return_value=self.password) as password:
-            result, status = self.command(["timer", "--minutes", "60"])
+    def test_cli_cannot_replace_an_ongoing_timer(self):
+        first_result, _ = self.command(["timer", "--minutes", "30"])
+        self.assertEqual(first_result, 0)
+        before = self.store.path.read_bytes()
+        result, status = self.command(["timer", "--minutes", "60"])
+        self.assertEqual(result, 1)
+        self.assertFalse(status["ok"])
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_status_migrates_existing_state_in_place(self):
+        saved = legacy_state(policy())
+        self.store.path.write_text(json.dumps(saved), encoding="utf-8")
+        result, status = self.command(["status"])
         self.assertEqual(result, 0)
-        password.assert_called_once()
-        self.assertNotIn(self.password, repr(status))
-        self.assertEqual(instant(status["timer"]["allowed_until"]) - instant(status["timer"]["started_at"]), gate.timedelta(minutes=60))
+        self.assertEqual(status["policy"], saved["policy"])
+        migrated = json.loads(self.store.path.read_bytes())
+        self.assertEqual(migrated["version"], 2)
+        self.assertFalse({"password", "auth_failures", "unlock"} & migrated.keys())
 
-    def test_restrict_does_not_read_chat_prompt_or_ask_password(self):
-        self.configure()
+    def test_restrict_does_not_read_chat_prompt(self):
         class NoPromptInput:
             @property
             def buffer(self):
@@ -700,11 +666,11 @@ class NativeCliTests(unittest.TestCase):
                 raise AssertionError("restrict must not read a chat prompt")
             def readline(self, *_args):
                 raise AssertionError("restrict must not read a chat prompt")
-        with mock.patch.object(sys, "stdin", NoPromptInput()), mock.patch.object(gate, "native_password", side_effect=AssertionError("unexpected password dialog")) as password:
+        with mock.patch.object(sys, "stdin", NoPromptInput()):
             result, status = self.command(["restrict", "--minutes", "30"])
         self.assertEqual(result, 0)
         self.assertTrue(status["restricted"])
-        password.assert_not_called()
+        self.assertEqual(self.store.read()["version"], 2)
 
     def test_folder_cli_and_hooks_use_the_session_directory(self):
         self.configure()
@@ -749,47 +715,41 @@ class NativeCliTests(unittest.TestCase):
                         event, restricted, MESSAGE + "。剩余 20 分钟"
                     ))
 
-    def test_invalid_folder_does_not_prompt_or_mutate(self):
+    def test_invalid_folder_does_not_mutate(self):
         self.configure()
         before = self.store.path.read_bytes()
         for folder in ["relative", str(self.directory / "Missing"), str(self.store.path)]:
-            with self.subTest(folder=folder), mock.patch.object(
-                gate, "native_password", side_effect=AssertionError("unexpected password dialog")
-            ) as password:
+            with self.subTest(folder=folder):
                 result, status = self.command(["restrict", "--minutes", "20", "--folder", folder])
                 self.assertEqual(result, 1)
                 self.assertFalse(status["ok"])
-                password.assert_not_called()
                 self.assertEqual(self.store.path.read_bytes(), before)
 
-    def test_configure_from_stdin_saves_policy_and_selected_timezone(self):
-        self.configure()
+    def test_configure_from_stdin_initializes_and_saves_policy_and_selected_timezone(self):
+        self.assertFalse(self.store.path.exists())
         raw = {
             "enabled": True,
             "timezone": "Asia/Tokyo",
             "daily": [{"days": [0, 2, 4], "start": "09:00", "end": "10:30"}],
-            "once": [{"start": "2026-11-16T09:00", "end": "2026-11-16T10:00"}],
+            "once": [{"start": "2099-11-16T09:00", "end": "2099-11-16T10:00"}],
         }
-        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(raw))), mock.patch.object(gate, "native_password", return_value=self.password) as password:
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(raw))):
             result, status = self.command(["configure", "--policy-file", "-"])
         self.assertEqual(result, 0)
-        password.assert_called_once()
         saved_policy = self.store.read()["policy"]
         self.assertEqual(saved_policy, gate.normalize_policy(raw))
         self.assertEqual(saved_policy["timezone"], "Asia/Tokyo")
-        self.assertEqual(instant(saved_policy["once"][0]["start"]), instant("2026-11-16T00:00:00+00:00"))
+        self.assertEqual(instant(saved_policy["once"][0]["start"]), instant("2099-11-16T00:00:00+00:00"))
         self.assertEqual(status["policy"], saved_policy)
-        self.assertNotIn(self.password, repr(status))
 
-    def test_invalid_or_oversized_stdin_policy_does_not_prompt_or_mutate(self):
+    def test_invalid_or_oversized_stdin_policy_does_not_mutate(self):
         self.configure()
         before = self.store.path.read_bytes()
         for raw in ["{broken-json", json.dumps({"enabled": True, "timezone": "Not/A_Timezone", "daily": [], "once": []}), " " * (gate.MAX_BODY + 1)]:
-            with self.subTest(length=len(raw)), mock.patch.object(sys, "stdin", io.StringIO(raw)), mock.patch.object(gate, "native_password", side_effect=AssertionError("unexpected password dialog")) as password:
+            with self.subTest(length=len(raw)), mock.patch.object(sys, "stdin", io.StringIO(raw)):
                 result, status = self.command(["configure", "--policy-file", "-"])
                 self.assertEqual(result, 1)
                 self.assertFalse(status["ok"])
-                password.assert_not_called()
                 self.assertEqual(self.store.path.read_bytes(), before)
 
 

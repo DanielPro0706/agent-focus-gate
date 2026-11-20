@@ -1,28 +1,21 @@
 #!/usr/bin/env python3
-"""Local schedule, countdown and password gate. Python 3.9+, standard library only."""
+"""Local schedule and countdown gate. Python 3.9+, standard library only."""
 import argparse
-import base64
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import fcntl
-import hashlib
-import hmac
 import json
 from math import ceil
 import os
 from pathlib import Path
 import re
-import secrets
 import sys
-import subprocess
-import getpass
 import tempfile
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-MESSAGE = "当前处于限制使用时段，请使用Chat模式或输入密码"
+MESSAGE = "当前处于限制使用时段，请等待限制结束"
 UTC = timezone.utc
-ITERATIONS = 600000
-VERSION = 1
+VERSION = 2
 MAX_BODY = 65536
 
 
@@ -133,45 +126,6 @@ def is_scheduled(policy, now):
     return any(_parse_date(item["start"]) <= current < _parse_date(item["end"]) for item in policy["once"])
 
 
-def make_password(password):
-    if not isinstance(password, str) or not 8 <= len(password) <= 1024:
-        raise ValueError("密码须为 8—1024 个字符")
-    salt = secrets.token_bytes(32)
-    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, ITERATIONS)
-    return {"algorithm": "pbkdf2-sha256", "iterations": ITERATIONS,
-            "salt": base64.b64encode(salt).decode("ascii"),
-            "digest": base64.b64encode(digest).decode("ascii")}
-
-
-def _password_parts(record):
-    if not isinstance(record, dict) or record.get("algorithm") != "pbkdf2-sha256":
-        raise ValueError("密码记录无效")
-    count = _integer(record.get("iterations"), 100000, 2000000, "哈希迭代次数")
-    try:
-        salt = base64.b64decode(record["salt"], validate=True)
-        digest = base64.b64decode(record["digest"], validate=True)
-    except (ValueError, KeyError, TypeError):
-        raise ValueError("密码记录无效") from None
-    if len(salt) != 32 or len(digest) != 32:
-        raise ValueError("密码记录无效")
-    return count, salt, digest
-
-
-def verify_password(password, record):
-    if not isinstance(password, str) or len(password) > 1024:
-        return False
-    try:
-        count, salt, digest = _password_parts(record)
-    except ValueError:
-        return False
-    actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, count)
-    return hmac.compare_digest(actual, digest)
-
-
-def policy_fingerprint(policy):
-    return hashlib.sha256(json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _timer_status(timer, now):
     if timer is None:
         return None
@@ -250,35 +204,18 @@ def _folder_intervals(rules, folder):
 def evaluate_state(state, now, folder=None):
     now = _aware(now).astimezone(UTC)
     if state is None:
-        return {"configured": False, "restricted": False, "unlocked_until": None,
-                "policy": default_policy(), "timer": None, "message": "尚未设置密码和限制规则"}
-    if not isinstance(state, dict) or state.get("version") != VERSION:
+        return {"configured": False, "restricted": False, "policy": default_policy(),
+                "timer": None, "message": "尚未设置限制规则"}
+    if not isinstance(state, dict) or type(state.get("version")) is not int or state["version"] not in (1, VERSION):
         raise ValueError("配置版本无效")
-    _password_parts(state.get("password"))
     policy = normalize_policy(state.get("policy"))
     timer = _timer_status(state.get("timer"), now)
     rules = _folder_restrictions(state.get("folder_restrictions", []))
-    active_folder_starts = [start for start, end in _folder_intervals(rules, folder) if start <= now < end]
-    restricted = (bool(active_folder_starts) or is_scheduled(policy, now)
+    folder_restricted = any(start <= now < end for start, end in _folder_intervals(rules, folder))
+    restricted = (folder_restricted or is_scheduled(policy, now)
                   or (timer is not None and timer["phase"] == "cooldown"))
-    unlocked_until = None
-    unlock = state.get("unlock")
-    if isinstance(unlock, dict):
-        try:
-            issued = _parse_date(unlock.get("issued_at")).astimezone(UTC)
-            until = _parse_date(unlock.get("until")).astimezone(UTC)
-            duration = until - issued
-            valid = timedelta(0) < duration <= timedelta(hours=1)
-            valid = valid and unlock.get("policy_hash") == policy_fingerprint(policy) and issued <= now < until
-            valid = valid and all(start < issued for start in active_folder_starts)
-            if valid:
-                unlocked_until = _iso(until)
-                restricted = False
-        except ValueError:
-            pass
-    status = {"configured": True, "restricted": restricted, "unlocked_until": unlocked_until,
-              "policy": policy, "timer": timer,
-              "message": MESSAGE if restricted else ("密码临时解锁中" if unlocked_until else "当前允许使用")}
+    status = {"configured": True, "restricted": restricted, "policy": policy, "timer": timer,
+              "message": MESSAGE if restricted else "当前允许使用"}
     if rules:
         status["folder_restrictions"] = rules
     return status
@@ -411,10 +348,14 @@ class StateStore:
             os.close(fd)
 
     def write(self, state):
+        # Store only current fields so legacy overrides and credentials are discarded.
+        saved = {"version": VERSION, "policy": state["policy"], "timer": state.get("timer")}
+        if state.get("folder_restrictions"):
+            saved["folder_restrictions"] = state["folder_restrictions"]
         # Atomic edit: readers see the previous or the next complete file.
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".state-", dir=self.directory, delete=False) as target:
             os.chmod(target.name, 0o600)
-            json.dump(state, target, ensure_ascii=False, indent=2)
+            json.dump(saved, target, ensure_ascii=False, indent=2)
             target.write("\n")
             target.flush()
             os.fsync(target.fileno())
@@ -425,157 +366,80 @@ class StateStore:
         return evaluate_state(self.read(), now or datetime.now(UTC), folder)
 
 
-class AuthError(ValueError):
-    pass
+    def migrate(self):
+        state = self.read()
+        if state is None or state.get("version") != 1:
+            return
+        with self.locked():
+            state = self.read()
+            if state is not None and state.get("version") == 1:
+                evaluate_state(state, datetime.now(UTC))
+                self.write(state)
 
 
 class Controller:
     def __init__(self, store):
         self.store = store
 
-    def _authenticate(self, state, password, now):
-        auth = state.get("auth_failures", {})
-        blocked = auth.get("blocked_until")
-        if blocked:
-            try:
-                if now < _parse_date(blocked):
-                    raise AuthError("密码尝试次数过多，请稍后再试（最多等待 30 秒）")
-            except ValueError as error:
-                if isinstance(error, AuthError):
-                    raise
-        if not verify_password(password, state["password"]):
-            count = auth.get("count", 0) if not blocked else 0
-            count = count + 1 if type(count) is int else 1
-            state["auth_failures"] = {"count": count,
-                    "blocked_until": _iso(now + timedelta(seconds=30)) if count >= 5 else None}
-            self.store.write(state)
-            raise AuthError("密码错误")
-        state["auth_failures"] = {"count": 0, "blocked_until": None}
-
-    def action(self, route, body, now=None):
-        now = _aware(now or datetime.now(UTC)).astimezone(UTC)
-        if not isinstance(body, dict):
-            raise ValueError("请求须为 JSON 对象")
+    def configure(self, policy, now=None):
+        policy = normalize_policy(policy)
         with self.store.locked():
+            now = _aware(now or datetime.now(UTC)).astimezone(UTC)
             state = self.store.read()
-            if route == "/api/setup":
-                if state is not None:
-                    raise ValueError("已完成设置，请用现有密码修改")
-                state = {"version": VERSION, "password": make_password(body.get("password")),
-                         "policy": normalize_policy(body.get("policy")), "unlock": None, "timer": None}
-            else:
-                if state is None:
-                    raise ValueError("请先设置密码")
-                evaluate_state(state, now)
-                if route != "/api/lock":
-                    self._authenticate(state, body.get("password"), now)
-                if route == "/api/policy":
-                    state["policy"] = normalize_policy(body.get("policy"))
-                    state["unlock"] = None
-                elif route == "/api/unlock":
-                    minutes = body.get("minutes")
-                    if type(minutes) is not int or minutes not in (15, 30, 60):
-                        raise ValueError("解锁时长须为 15、30 或 60 分钟")
-                    state["unlock"] = {"issued_at": _iso(now), "until": _iso(now + timedelta(minutes=minutes)),
-                                       "policy_hash": policy_fingerprint(state["policy"])}
-                elif route == "/api/lock":
-                    state["unlock"] = None
-                elif route == "/api/password":
-                    state["password"] = make_password(body.get("new_password"))
-                    state["unlock"] = None
-                elif route == "/api/timer":
-                    minutes = _integer(body.get("minutes"), 1, 240, "限时使用分钟数")
-                    allowed = now + timedelta(minutes=minutes)
-                    state["timer"] = {"started_at": _iso(now), "allowed_until": _iso(allowed),
-                                      "lock_until": _iso(allowed + timedelta(hours=1))}
-                    state["unlock"] = None
-                elif route == "/api/timer/cancel":
-                    state["timer"] = None
-                    state["unlock"] = None
-                else:
-                    raise ValueError("未知操作")
+            current = evaluate_state(state, now)["policy"]
+            if is_scheduled(current, now):
+                raise ValueError("全局限制生效期间无法修改定时计划，请等待当前禁用时段结束")
+            pending = [item for item in current["once"] if current["enabled"] and _parse_date(item["end"]) > now]
+            if pending and not policy["enabled"]:
+                raise ValueError("已有未结束的一次性全局限制，无法关闭定时计划")
+            intervals = {(item["start"], item["end"]): item for item in pending + policy["once"]}
+            policy["once"] = list(intervals.values())
+            state = state if state is not None else {"version": VERSION}
+            state["policy"] = normalize_policy(policy)
             self.store.write(state)
             return evaluate_state(state, now)
 
     def restrict(self, minutes, now=None, folder=None):
         minutes = _integer(minutes, 1, 10080, "禁止使用分钟数")
         folder = _existing_folder(folder) if folder is not None else None
-        now = _aware(now or datetime.now(UTC)).astimezone(UTC)
-        interval = {"start": _iso(now), "end": _iso(now + timedelta(minutes=minutes))}
         with self.store.locked():
+            now = _aware(now or datetime.now(UTC)).astimezone(UTC)
+            interval = {"start": _iso(now), "end": _iso(now + timedelta(minutes=minutes))}
             state = self.store.read()
-            if state is None:
-                raise ValueError("请先设置密码")
-            evaluate_state(state, now)
+            current = evaluate_state(state, now)
+            state = state if state is not None else {"version": VERSION, "policy": current["policy"]}
             if folder is None:
-                policy = state["policy"]
+                policy = current["policy"]
                 if len(policy["once"]) >= 100:
                     # Keep ongoing and future rules when reclaiming expired slots.
                     policy["once"] = [item for item in policy["once"] if _parse_date(item["end"]) > now]
                 policy["once"].append(interval)
                 policy["enabled"] = True
                 state["policy"] = normalize_policy(policy)
-                state["unlock"] = None
             else:
-                rules = [rule for rule in state.get("folder_restrictions", []) if _parse_date(rule["end"]) > now]
+                rules = [rule for rule in current.get("folder_restrictions", []) if _parse_date(rule["end"]) > now]
                 rules.append({**interval, "folder": str(folder)})
                 state["folder_restrictions"] = _folder_restrictions(rules)
             self.store.write(state)
             return evaluate_state(state, now, folder)
 
-    def start_timer(self, minutes, password=None, now=None):
+    def start_timer(self, minutes, now=None):
         minutes = _integer(minutes, 1, 240, "限时使用分钟数")
-        now = _aware(now or datetime.now(UTC)).astimezone(UTC)
         with self.store.locked():
+            now = _aware(now or datetime.now(UTC)).astimezone(UTC)
             state = self.store.read()
-            if state is None:
-                raise ValueError("请先设置密码")
             current = evaluate_state(state, now)
-            active_timer = current["timer"] and current["timer"]["phase"] != "finished"
-            if current["restricted"] or current["unlocked_until"] or active_timer:
-                self._authenticate(state, password, now)
+            timer = current["timer"]
+            if timer and timer["phase"] != "finished":
+                raise ValueError("计时已开始，请等待使用期和冷却期结束")
+            if current["restricted"]:
+                raise ValueError("当前处于全局限制使用时段，请等待限制结束")
+            state = state if state is not None else {"version": VERSION, "policy": current["policy"]}
             allowed = now + timedelta(minutes=minutes)
             state["timer"] = {"started_at": _iso(now), "allowed_until": _iso(allowed),
                               "lock_until": _iso(allowed + timedelta(hours=1))}
-            state["unlock"] = None
             self.store.write(state)
             return evaluate_state(state, now)
-
-
-def native_password(prompt):
-    """Prompt outside model context. Never put a password in argv or stdout."""
-    if sys.platform == "darwin":
-        script = '''on run argv
-          set answer to display dialog (item 1 of argv) with title "FocusGate" default answer "" with hidden answer buttons {"取消", "确定"} default button "确定" cancel button "取消"
-          return text returned of answer
-        end run'''
-        try:
-            result = subprocess.run(["/usr/bin/osascript", "-e", script, prompt],
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    text=True, timeout=180)
-        except subprocess.TimeoutExpired:
-            raise ValueError("密码输入超时，未更改限制") from None
-        if result.returncode:
-            raise ValueError("已取消密码输入，未更改限制")
-        return result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
-    if sys.stdin.isatty():
-        return getpass.getpass(prompt + ": ")
-    raise ValueError("需要本机密码输入窗口；请在本机终端运行此命令")
-
-
-def new_password():
-    first = native_password("设置 FocusGate 密码（至少 8 个字符；密码不会进入聊天）")
-    if len(first) < 8:
-        raise ValueError("密码至少需要 8 个字符，未保存")
-    second = native_password("再次输入刚才的密码")
-    if not hmac.compare_digest(first.encode("utf-8"), second.encode("utf-8")):
-        raise ValueError("两次密码不同，未保存")
-    return first
-
-
-def ensure_configured(controller):
-    if controller.store.read() is None:
-        controller.action("/api/setup", {"password": new_password(), "policy": default_policy()})
 
 
 def run_hook(store, event):
@@ -590,8 +454,6 @@ def run_hook(store, event):
         status = store.status(now, folder)
         message = _restriction_message(status, now, folder) if status["restricted"] else MESSAGE
         result = hook_output(event, status["restricted"], message)
-        if not status["configured"] and event == "SessionStart":
-            result = {"systemMessage": "FocusGate 尚未配置。请在终端运行 /usr/bin/python3 -I -B /etc/codex/focus-gate/focus_gate.py setup 设置密码。"}
     except Exception:
         result = hook_output(event, True)
     print(json.dumps(result, ensure_ascii=False))
@@ -599,10 +461,9 @@ def run_hook(store, event):
 
 def main():
     parser = argparse.ArgumentParser(description="FocusGate 本机使用限制（Skill + Hooks，无网页）")
-    parser.add_argument("command", choices=("hook", "setup", "restrict", "timer", "configure",
-                                          "unlock", "cancel-timer", "lock", "password", "status"))
+    parser.add_argument("command", choices=("hook", "restrict", "timer", "configure", "status"))
     parser.add_argument("--data-dir", help="独立测试或部署的数据目录；日常使用请勿指定")
-    parser.add_argument("--minutes", type=int, help="restrict 1—10080；timer 1—240；unlock 15/30/60")
+    parser.add_argument("--minutes", type=int, help="restrict 1—10080；timer 1—240")
     parser.add_argument("--folder", help="restrict 或 status 对应的文件夹绝对路径")
     parser.add_argument("--policy-file", help="configure 使用的 JSON 策略文件；- 表示从 stdin 读取")
     parser.add_argument("--event", choices=("SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest"))
@@ -617,51 +478,23 @@ def main():
             raise ValueError("--folder 仅用于 restrict 或 status")
         folder = _existing_folder(args.folder) if args.folder is not None else None
         if args.command == "status":
+            store.migrate()
             result = store.status(folder=folder or Path.cwd())
-        elif args.command == "lock":
-            result = controller.action("/api/lock", {})
-        elif args.command == "setup":
-            ensure_configured(controller)
-            result = store.status()
-        elif args.command in ("restrict", "timer"):
-            high = 10080 if args.command == "restrict" else 240
-            _integer(args.minutes, 1, high, "分钟数")
-            ensure_configured(controller)
-            if args.command == "restrict":
-                result = controller.restrict(args.minutes, folder=folder)
-            else:
-                current = store.status()
-                needs_password = current["restricted"] or current["unlocked_until"] or (
-                    current["timer"] and current["timer"]["phase"] != "finished")
-                password = native_password("输入 FocusGate 密码以重设使用计时") if needs_password else None
-                result = controller.start_timer(args.minutes, password)
-        elif args.command == "configure":
+        elif args.command == "restrict":
+            result = controller.restrict(args.minutes, folder=folder)
+        elif args.command == "timer":
+            result = controller.start_timer(args.minutes)
+        else:
             if not args.policy_file:
                 raise ValueError("configure 需要 --policy-file")
-            raw_policy = sys.stdin.read(MAX_BODY + 1) if args.policy_file == "-" else Path(args.policy_file).read_text(encoding="utf-8")
+            if args.policy_file == "-":
+                raw_policy = sys.stdin.read(MAX_BODY + 1)
+            else:
+                with Path(args.policy_file).open(encoding="utf-8") as source:
+                    raw_policy = source.read(MAX_BODY + 1)
             if len(raw_policy) > MAX_BODY:
                 raise ValueError("计划文件过大")
-            policy = normalize_policy(json.loads(raw_policy))
-            ensure_configured(controller)
-            result = controller.action("/api/policy", {"password": native_password("输入 FocusGate 密码以保存计划"), "policy": policy})
-        elif args.command == "unlock":
-            minutes = 60 if args.minutes is None else args.minutes
-            if minutes not in (15, 30, 60):
-                raise ValueError("解锁时长须为 15、30 或 60 分钟")
-            result = controller.action("/api/unlock", {"password": native_password("当前处于限制使用时段，请输入 FocusGate 密码解锁"), "minutes": minutes})
-        elif args.command == "cancel-timer":
-            result = controller.action("/api/timer/cancel", {"password": native_password("输入 FocusGate 密码以取消本次计时或冷却")})
-        elif args.command == "password":
-            old = native_password("输入当前 FocusGate 密码")
-            # Verify before asking for a replacement. No state change yet.
-            with store.locked():
-                state = store.read()
-                if state is None:
-                    raise ValueError("请先设置密码")
-                controller._authenticate(state, old, datetime.now(UTC))
-            result = controller.action("/api/password", {"password": old, "new_password": new_password()})
-        else:
-            raise ValueError("未知操作")
+            result = controller.configure(json.loads(raw_policy))
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except (ValueError, OSError) as error:

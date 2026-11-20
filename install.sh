@@ -46,7 +46,7 @@ check_paths() {
 }
 
 require_root() {
-    [[ $EUID -eq 0 ]] || fail '请用 sudo /bin/bash 运行此脚本的 install 或 rollback 命令。'
+    [[ $EUID -eq 0 ]] || fail '请用 sudo /bin/bash 运行此脚本的 install 命令。'
 }
 
 archive_directory() {
@@ -55,7 +55,7 @@ archive_directory() {
 
 [[ $(/usr/bin/uname -s) == Darwin ]] || fail '此安装脚本适用于 macOS。'
 [[ ! -L $bundled_policy && -f $bundled_policy ]] || fail '安装包缺少 requirements.toml。'
-[[ $# -eq 1 ]] || fail '用法为 /bin/bash install.sh check、install 或 rollback。'
+[[ $# -eq 1 ]] || fail '用法为 /bin/bash install.sh check 或 install。'
 
 case "$1" in
     check)
@@ -90,24 +90,5 @@ case "$1" in
         check_paths
         printf '%s\n' 'FocusGate 系统文件已安装。请完全退出并重新打开 Codex，再检查 Hooks 中的受管状态。'
         ;;
-    rollback)
-        require_root
-        check_paths
-        if ! exists "$policy" && ! exists "$hook"; then
-            printf '%s\n' 'FocusGate 受管规则已停用。'
-            exit 0
-        fi
-        if ! exists "$policy"; then
-            /usr/bin/cmp -s "$bundled_hook" "$hook" || fail "已有其他脚本 ${hook}，请由管理员检查。"
-        fi
-        backup=$(archive_directory)
-        if exists "$policy"; then
-            /bin/mv "$policy" "$backup/requirements.toml"
-        fi
-        if exists "$hook"; then
-            /bin/mv "$hook" "$backup/focus_gate.py"
-        fi
-        printf '%s\n' "系统文件移至 ${backup}。请完全退出并重新打开 Codex。"
-        ;;
-    *) fail '用法为 /bin/bash install.sh check、install 或 rollback。' ;;
+    *) fail '用法为 /bin/bash install.sh check 或 install。' ;;
 esac
