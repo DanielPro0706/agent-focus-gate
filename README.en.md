@@ -93,6 +93,8 @@ Choose 1–240 minutes for either timer. It starts immediately and keeps countin
 
 A project timer cannot start while a global timer or a project timer covering that folder is in its usage period or cooldown. Projects with separate scopes can have independent timers.
 
+After starting a timer for a subfolder, you can still add a parent-folder or global timer. The original subfolder timer remains in effect and is neither reset nor lifted. Overlapping or adjoining cooldown intervals that apply to a folder are combined. The remaining-time message ends at the first available instant; a later cooldown separated by a gap is not included in the current countdown.
+
 ### Block one project
 
 ```sh
